@@ -181,3 +181,111 @@ def test_autocomplete_ids_take_priority_over_id_shaped_names(store):
     assert store.item(key, "#2").name == "Actual second item"
     store.edit_tier(key, "S", name="#2")
     assert store.tier(key, "#2").name == "A"
+
+
+def test_migrate_v1_database_without_losing_existing_data(tmp_path, image_bytes):
+    old = Store(tmp_path, 123)
+    key = old.create("Original")
+    old.add_item(key, "Existing", "S", image=image_bytes)
+    old.bind(key, 100, 200)
+    old.synced(key, old.get(key).revision)
+    before = old.get(key)
+    # Recreate the exact v1 table layout and version, with existing data in place.
+    with old.db:
+        old.db.execute("DROP TABLE item_description_images")
+        old.db.execute("ALTER TABLE items DROP COLUMN description")
+        old.db.execute("PRAGMA user_version=1")
+    old.close()
+    upgraded = Store(tmp_path, 123)
+    assert upgraded.db.execute("PRAGMA user_version").fetchone()[0] == 2
+    assert upgraded.get(key) == before
+    upgraded.edit_item(key, "Existing", description="**Details**\nSecond line")
+    upgraded.add_description_image(key, "Existing", image_bytes)
+    saved = upgraded.get(key)
+    upgraded.close()
+    reopened = Store(tmp_path, 123)
+    reopened.collect_images()
+    assert reopened.get(key) == saved
+    assert len(list(reopened.images.iterdir())) == 2
+    reopened.close()
+
+
+def test_description_image_limit_order_and_clear(store, image_bytes):
+    key = store.create("Descriptions")
+    store.add_item(
+        key, "One", "S", image=image_bytes, description="Text", description_image=image_bytes
+    )
+    original = store.item(key, "One").image
+    for _ in range(3):
+        store.add_description_image(key, "One", image_bytes)
+    before = store.item(key, "One")
+    with pytest.raises(UserError, match="at most 4"):
+        store.add_description_image(key, "One", image_bytes)
+    assert len(list(store.images.iterdir())) == 5
+    store.remove_description_image(key, "One", 2)
+    assert store.item(key, "One").description_images == (
+        before.description_images[0],
+        *before.description_images[2:],
+    )
+    assert not (store.images / before.description_images[1]).exists()
+    store.edit_item(key, "One", description="Updated")
+    assert len(store.item(key, "One").description_images) == 3
+    store.edit_item(key, "One", clear_description=True)
+    item = store.item(key, "One")
+    assert item.description == ""
+    assert item.description_images == ()
+    assert item.image == original
+    assert [p.name for p in store.images.iterdir()] == [original]
+
+
+@pytest.mark.parametrize("action", ["item", "list"])
+def test_deleting_item_or_list_cleans_description_images(store, image_bytes, action):
+    key = store.create("Descriptions")
+    store.add_item(key, "Remove", "S", description="Text", description_image=image_bytes)
+    store.add_description_image(key, "Remove", image_bytes)
+    keep = store.create("Keep")
+    store.add_item(keep, "Keep", "S", description_image=image_bytes)
+    preserved = store.item(keep, "Keep").description_images[0]
+    if action == "item":
+        store.delete_item(key, "Remove")
+    else:
+        store.delete(key)
+    assert [r[0] for r in store.db.execute("SELECT image FROM item_description_images")] == [
+        preserved
+    ]
+    assert [p.name for p in store.images.iterdir()] == [preserved]
+
+
+def test_description_validation_and_rollback(store, image_bytes):
+    key = store.create("Descriptions")
+    store.add_item(key, "First", "S", description="Original", description_image=image_bytes)
+    store.add_item(key, "Second", "S")
+    before = store.get(key)
+    for description in ("x" * 4001, "invalid\x00text"):
+        with pytest.raises(UserError):
+            store.edit_item(key, "First", description=description)
+    with pytest.raises(UserError):
+        store.edit_item(key, "First", description="New", clear_description=True)
+    with pytest.raises(UserError):
+        store.edit_item(key, "First", name="Second", clear_description=True)
+    with pytest.raises(UserError):
+        store.add_item(key, "Second", "S", image=image_bytes, description_image=image_bytes)
+    for position in (0, 2):
+        with pytest.raises(UserError):
+            store.remove_description_image(key, "First", position)
+    assert store.get(key) == before
+    assert len(list(store.images.iterdir())) == 1
+
+
+def test_description_image_ids_are_scoped_and_survive_tier_moves(store, image_bytes):
+    first, second = store.create("First"), store.create("Second")
+    store.add_item(first, "One", "S", description="Details", description_image=image_bytes)
+    item = store.item(first, "One")
+    with pytest.raises(UserError):
+        store.add_description_image(second, f"#{item.id}", image_bytes)
+    with pytest.raises(UserError):
+        store.remove_description_image(second, f"#{item.id}", 1)
+    store.delete_tier(first, "S", "A")
+    moved = store.item(first, "One")
+    assert moved.description == item.description
+    assert moved.description_images == item.description_images

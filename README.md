@@ -7,6 +7,7 @@ that message, including replacing its images; they do not post another board.
 
 - Custom list titles and 1–15 named, ordered, colored tiers.
 - Up to 300 items per list, with names and optional uploaded images.
+- Item descriptions with formatted text and up to four separate images, shown on demand.
 - Manual ordering within tiers; move items between tiers without recreating them.
 - Slash commands work in any channel. Confirmations and previews are private.
 - SQLite and local image storage persist across container restarts and upgrades.
@@ -84,9 +85,11 @@ within their list (ignoring case and Unicode normalization).
 | `/tier move` | `list`, `tier`, `position` |
 | `/tier color` | `list`, `tier`, `color` (`#RRGGBB`) |
 | `/tier delete` | `list`, `tier`, optional `destination` for its items |
-| `/item add` | `list`, `name`, `tier`, optional `image`, optional `position` |
-| `/item show` | `list`, `item`; full name, tier, position, and original normalized image |
-| `/item edit` | `list`, `item`, optional `name`, `image`, or `remove-image:true` |
+| `/item add` | `list`, `name`, `tier`, optional `image`, `position`, `description`, `description-image` |
+| `/item show` | `list`, `item`; description, description images, board thumbnail, tier, and position |
+| `/item edit` | `list`, `item`, optional `name`, `image`, `remove-image:true`, `description`, or `clear-description:true` |
+| `/item description-image-add` | `list`, `item`, `image`; append an image to the description (up to four) |
+| `/item description-image-remove` | `list`, `item`, `position`; remove a numbered description image |
 | `/item move` | `list`, `item`, `tier`, optional `position` |
 | `/item delete` | `list`, `item`; delete the item and its stored image |
 
@@ -107,6 +110,32 @@ Slash commands do not leave ordinary request messages. Replies are ephemeral
 Message Content access are unnecessary. Prefix commands such as `!tierlist` are
 not supported.
 
+## Item descriptions
+
+Add details through the `description` option on `/item add` or `/item edit`.
+Descriptions support up to 4,000 characters, line breaks, and Discord text
+formatting such as **bold**, italics, and links. They appear only in the private
+`/item show` response, never on the tier-list image.
+
+Description images are separate from the item's `image` (its board thumbnail).
+Upload the first with `/item add description-image:`, or add images later with
+`/item description-image-add`. Up to four images appear below the description,
+numbered in upload order. Image-only descriptions are also supported.
+
+```text
+/item edit list:Movie night item:Arrival description:A thoughtful sci-fi film with beautiful cinematography.
+/item description-image-add list:Movie night item:Arrival image:<upload>
+/item show list:Movie night item:Arrival
+/item description-image-remove list:Movie night item:Arrival position:1
+```
+
+Editing the description text keeps its images. Remove an individual image by its
+number from `/item show`; remaining images are renumbered. To replace an image,
+remove it and upload the replacement (which appends at the end). Use
+`/item edit clear-description:true` to remove all description text and images
+while retaining the board thumbnail. Deleting an item or list also removes its
+description images.
+
 ## Boards and images
 
 Hooking initially creates one message. Subsequent changes replace that message's
@@ -122,8 +151,9 @@ and item names 80. The bundled Noto Sans font covers Latin, Greek, and Cyrillic;
 other scripts and color emoji may display missing glyphs in rendered boards.
 
 Images must be PNG, JPEG, or WebP, at most 10 MiB and 25 megapixels. The bot keeps a
-256-pixel normalized PNG copy, applies EXIF orientation, strips metadata, and uses
-the first frame of animated uploads. Transparent images are supported. Raw
+normalized PNG copy with a maximum dimension of 256 pixels for board thumbnails
+or 1,024 pixels for description images. It applies EXIF orientation, strips
+metadata, and uses the first frame of animated uploads. Transparent images are supported. Raw
 originals are not retained. Uploads are stored locally, so expiring Discord
 attachment URLs do not break your lists. External image URLs are not accepted.
 
@@ -182,6 +212,11 @@ For an upgrade, back up first, update the checkout, and run:
 docker compose up -d --build
 docker compose logs --tail=100 bot
 ```
+
+The description feature automatically upgrades version 1 databases to version 2
+on startup, preserving existing items, images, ordering, and channel hooks. Old
+items start with empty descriptions. Restarting also registers the new command
+options. To return to the older bot version, restore a pre-upgrade backup.
 
 ## Local development and checks
 

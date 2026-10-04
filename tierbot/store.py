@@ -8,7 +8,18 @@ from contextlib import contextmanager
 from pathlib import Path
 from uuid import uuid4
 
-from tierbot.models import COLORS, DEFAULT_TIERS, MAX_ITEMS, MAX_TIERS, Board, Item, Tier, UserError
+from tierbot.models import (
+    COLORS,
+    DEFAULT_TIERS,
+    MAX_DESCRIPTION_IMAGES,
+    MAX_DESCRIPTION_LENGTH,
+    MAX_ITEMS,
+    MAX_TIERS,
+    Board,
+    Item,
+    Tier,
+    UserError,
+)
 
 log = logging.getLogger(__name__)
 
@@ -35,6 +46,16 @@ def position_index(position: int | None, length: int) -> int:
     return position - 1
 
 
+def clean_description(value: str) -> str:
+    if len(value) > MAX_DESCRIPTION_LENGTH:
+        raise UserError(f"Descriptions must be no longer than {MAX_DESCRIPTION_LENGTH} characters.")
+    if any(unicodedata.category(c) == "Cc" and c not in "\n\r\t" for c in value):
+        raise UserError(
+            "Descriptions cannot contain control characters other than line breaks and tabs."
+        )
+    return value.strip()
+
+
 class Store:
     def __init__(self, directory: Path, guild_id: int):
         directory.mkdir(parents=True, exist_ok=True)
@@ -47,7 +68,7 @@ class Store:
         self.db.execute("PRAGMA journal_mode = WAL")
         self.db.execute("PRAGMA busy_timeout = 5000")
         version = self.db.execute("PRAGMA user_version").fetchone()[0]
-        if version not in (0, 1):
+        if version not in (0, 1, 2):
             raise RuntimeError(f"Unsupported database version {version}; upgrade the bot.")
         self.db.executescript("""
             CREATE TABLE IF NOT EXISTS lists (
@@ -86,8 +107,23 @@ class Store:
             );
             CREATE INDEX IF NOT EXISTS items_order ON items(tier_id, position);
             CREATE INDEX IF NOT EXISTS tiers_order ON tiers(list_id, position);
-            PRAGMA user_version = 1;
         """)
+        if version < 2:
+            # Explicit BEGIN makes the column, table, and version change atomic together.
+            with self.db:
+                self.db.execute("BEGIN")
+                self.db.execute("ALTER TABLE items ADD COLUMN description TEXT NOT NULL DEFAULT ''")
+                self.db.execute("""
+                    CREATE TABLE item_description_images (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+                        image TEXT NOT NULL
+                    )
+                """)
+                self.db.execute(
+                    "CREATE INDEX description_images_item ON item_description_images(item_id, id)"
+                )
+                self.db.execute("PRAGMA user_version = 2")
 
     def close(self):
         self.db.close()
@@ -117,12 +153,27 @@ class Store:
         ).fetchone()
         if row is None:
             raise UserError("List not found. Choose a list from autocomplete.")
+        description_images: dict[int, list[str]] = {}
+        for image in self.db.execute(
+            "SELECT d.item_id, d.image FROM item_description_images d "
+            "JOIN items i ON i.id=d.item_id WHERE i.list_id=? ORDER BY d.id",
+            (list_id,),
+        ):
+            description_images.setdefault(image["item_id"], []).append(image["image"])
         tiers = []
         for tier in self.db.execute(
             "SELECT * FROM tiers WHERE list_id=? ORDER BY position, id", (list_id,)
         ).fetchall():
             items = tuple(
-                Item(i["id"], i["name"], i["tier_id"], i["position"], i["image"])
+                Item(
+                    i["id"],
+                    i["name"],
+                    i["tier_id"],
+                    i["position"],
+                    i["image"],
+                    i["description"],
+                    tuple(description_images.get(i["id"], ())),
+                )
                 for i in self.db.execute(
                     "SELECT * FROM items WHERE tier_id=? ORDER BY position, id", (tier["id"],)
                 )
@@ -206,6 +257,8 @@ class Store:
             self.db.execute("DELETE FROM lists WHERE id=?", (list_id,))
         for item in board.items:
             self.remove_image(item.image)
+            for image in item.description_images:
+                self.remove_image(image)
 
     def _order(self, table: str, ids: list[int]):
         assert table in ("tiers", "items")
@@ -274,25 +327,39 @@ class Store:
         tier: str,
         position: int | None = None,
         image: bytes | None = None,
+        *,
+        description: str = "",
+        description_image: bytes | None = None,
     ):
         name = clean_name(name)
+        description = clean_description(description)
         if len(self.get(list_id).items) >= MAX_ITEMS:
             raise UserError(f"A list can have at most {MAX_ITEMS} items.")
         target = self.tier(list_id, tier)
         ids = [i.id for i in target.items]
         index = position_index(position, len(ids))
-        filename = self.save_image(image) if image is not None else None
+        filename = detail_filename = None
         try:
+            filename = self.save_image(image) if image is not None else None
+            detail_filename = (
+                self.save_image(description_image) if description_image is not None else None
+            )
             with self.transaction(list_id):
                 cursor = self.db.execute(
-                    "INSERT INTO items(list_id,tier_id,name,name_key,position,image) "
-                    "VALUES(?,?,?,?,?,?)",
-                    (list_id, target.id, name, name_key(name), index, filename),
+                    "INSERT INTO items(list_id,tier_id,name,name_key,position,image,description) "
+                    "VALUES(?,?,?,?,?,?,?)",
+                    (list_id, target.id, name, name_key(name), index, filename, description),
                 )
+                if detail_filename:
+                    self.db.execute(
+                        "INSERT INTO item_description_images(item_id,image) VALUES(?,?)",
+                        (cursor.lastrowid, detail_filename),
+                    )
                 ids.insert(index, cursor.lastrowid)
                 self._order("items", ids)
         except Exception:
             self.remove_image(filename)
+            self.remove_image(detail_filename)
             raise
 
     def edit_item(
@@ -303,26 +370,77 @@ class Store:
         name: str | None = None,
         image: bytes | None = None,
         remove_image: bool = False,
+        description: str | None = None,
+        clear_description: bool = False,
     ):
         item = self.item(list_id, value)
         if image is not None and remove_image:
             raise UserError("Choose either a replacement image or remove-image, not both.")
-        if name is None and image is None and not remove_image:
-            raise UserError("Provide a new name, an image, or remove-image.")
+        if description is not None and clear_description:
+            raise UserError("Choose either a new description or clear-description, not both.")
+        if (
+            name is None
+            and image is None
+            and not remove_image
+            and description is None
+            and not clear_description
+        ):
+            raise UserError(
+                "Provide a name, image, description, remove-image, or clear-description."
+            )
+        detail = clean_description(description) if description is not None else item.description
+        if clear_description:
+            detail = ""
         name = clean_name(name) if name is not None else item.name
         new_image = self.save_image(image) if image is not None else None
         filename = new_image if image is not None else (None if remove_image else item.image)
         try:
             with self.transaction(list_id):
                 self.db.execute(
-                    "UPDATE items SET name=?, name_key=?, image=? WHERE id=?",
-                    (name, name_key(name), filename, item.id),
+                    "UPDATE items SET name=?, name_key=?, image=?, description=? WHERE id=?",
+                    (name, name_key(name), filename, detail, item.id),
                 )
+                if clear_description:
+                    self.db.execute(
+                        "DELETE FROM item_description_images WHERE item_id=?", (item.id,)
+                    )
         except Exception:
             self.remove_image(new_image)
             raise
         if filename != item.image:
             self.remove_image(item.image)
+        if clear_description:
+            for detail_image in item.description_images:
+                self.remove_image(detail_image)
+
+    def add_description_image(self, list_id: int, value: str, image: bytes):
+        item = self.item(list_id, value)
+        if len(item.description_images) >= MAX_DESCRIPTION_IMAGES:
+            raise UserError(
+                f"An item can have at most {MAX_DESCRIPTION_IMAGES} description images."
+            )
+        filename = self.save_image(image)
+        try:
+            with self.transaction(list_id):
+                self.db.execute(
+                    "INSERT INTO item_description_images(item_id,image) VALUES(?,?)",
+                    (item.id, filename),
+                )
+        except Exception:
+            self.remove_image(filename)
+            raise
+
+    def remove_description_image(self, list_id: int, value: str, position: int):
+        item = self.item(list_id, value)
+        if not 1 <= position <= len(item.description_images):
+            raise UserError("Choose an existing description image number from /item show.")
+        filename = item.description_images[position - 1]
+        with self.transaction(list_id):
+            self.db.execute(
+                "DELETE FROM item_description_images WHERE item_id=? AND image=?",
+                (item.id, filename),
+            )
+        self.remove_image(filename)
 
     def move_item(self, list_id: int, value: str, tier: str, position: int | None = None):
         item = self.item(list_id, value)
@@ -343,6 +461,8 @@ class Store:
             self.db.execute("DELETE FROM items WHERE id=?", (item.id,))
             self._order("items", [i.id for i in tier.items if i.id != item.id])
         self.remove_image(item.image)
+        for image in item.description_images:
+            self.remove_image(image)
 
     def bind(self, list_id: int, channel_id: int | None, message_id: int | None):
         self.get(list_id)
@@ -380,6 +500,7 @@ class Store:
     def collect_images(self):
         """Run at startup, before commands/rendering can access staged images."""
         used = {r[0] for r in self.db.execute("SELECT image FROM items WHERE image IS NOT NULL")}
+        used.update(r[0] for r in self.db.execute("SELECT image FROM item_description_images"))
         for path in self.images.glob("*.png"):
             if re.fullmatch(r"[0-9a-f]{32}\.png", path.name) and path.name not in used:
                 self.remove_image(path.name)

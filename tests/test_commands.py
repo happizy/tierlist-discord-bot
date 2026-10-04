@@ -28,6 +28,7 @@ def interaction(guild=123):
         user=SimpleNamespace(id=555),
         namespace=SimpleNamespace(),
         edit_original_response=AsyncMock(),
+        filesize_limit=8 * 1024 * 1024,
     )
 
 
@@ -54,7 +55,7 @@ async def test_discord_command_tree_schema(store):
                 for parameter in command["options"]:
                     if parameter["name"] in ("list", "tier", "item", "destination"):
                         assert parameter["autocomplete"] is True
-        assert count == 18
+        assert count == 20
         assert not bot.intents.message_content
         assert not bot.intents.messages
         assert not bot.intents.members
@@ -151,3 +152,83 @@ async def test_directory_pagination_is_private(cog):
     assert payload["ephemeral"] is True
     assert len(payload["embed"].fields) == 2
     assert payload["embed"].footer.text == "Page 2/2"
+
+
+async def test_add_and_show_description_with_separate_images(cog, image_bytes):
+    cog.store.create("Movies")
+    board_image = SimpleNamespace(size=len(image_bytes), read=AsyncMock(return_value=image_bytes))
+    detail_image = SimpleNamespace(size=len(image_bytes), read=AsyncMock(return_value=image_bytes))
+    await cog.item_add.callback(
+        cog,
+        interaction(),
+        "Movies",
+        "Arrival",
+        "S",
+        image=board_image,
+        description="**A favorite**\nBeautiful cinematography.",
+        description_image=detail_image,
+    )
+    await cog.description_image_add.callback(cog, interaction(), "Movies", "Arrival", detail_image)
+    request = interaction()
+    await cog.item_show.callback(cog, request, "Movies", "Arrival")
+    payload = request.followup.send.call_args.kwargs
+    assert payload["ephemeral"] is True
+    assert payload["allowed_mentions"].to_dict() == discord.AllowedMentions.none().to_dict()
+    assert payload["embeds"][0].description == "**A favorite**\nBeautiful cinematography."
+    assert payload["embeds"][0].thumbnail.url == "attachment://item.png"
+    assert [e.title for e in payload["embeds"][1:]] == [
+        "Description image 1",
+        "Description image 2",
+    ]
+    assert [f.filename for f in payload["files"]] == [
+        "item.png",
+        "description-1.png",
+        "description-2.png",
+    ]
+    assert all(f.fp.closed for f in payload["files"])
+    cog.sync.gateway.publish.assert_not_called()
+
+
+async def test_edit_description_and_remove_image_commands(cog, image_bytes):
+    key = cog.store.create("Movies")
+    cog.store.add_item(key, "Arrival", "S", description="Old", description_image=image_bytes)
+    await cog.item_edit.callback(cog, interaction(), "Movies", "Arrival", description="New")
+    assert cog.store.item(key, "Arrival").description == "New"
+    assert len(cog.store.item(key, "Arrival").description_images) == 1
+    await cog.description_image_remove.callback(cog, interaction(), "Movies", "Arrival", 1)
+    assert not cog.store.item(key, "Arrival").description_images
+    await cog.item_edit.callback(cog, interaction(), "Movies", "Arrival", clear_description=True)
+    assert cog.store.item(key, "Arrival").description == ""
+
+
+async def test_item_show_empty_description_and_missing_image(cog, image_bytes):
+    key = cog.store.create("Movies")
+    cog.store.add_item(key, "Arrival", "S", description_image=image_bytes)
+    filename = cog.store.item(key, "Arrival").description_images[0]
+    (cog.store.images / filename).unlink()
+    request = interaction()
+    await cog.item_show.callback(cog, request, "Movies", "Arrival")
+    payload = request.followup.send.call_args.kwargs
+    assert payload["embeds"][0].description == "No description yet."
+    assert "missing" in payload["embeds"][1].description
+    assert not payload["files"]
+
+
+async def test_item_show_closes_files_if_upload_fails(cog, image_bytes):
+    key = cog.store.create("Movies")
+    cog.store.add_item(key, "Arrival", "S", image=image_bytes, description_image=image_bytes)
+    request = interaction()
+    request.followup.send.side_effect = RuntimeError("upload failed")
+    with pytest.raises(RuntimeError, match="upload failed"):
+        await cog.item_show.callback(cog, request, "Movies", "Arrival")
+    assert all(f.fp.closed for f in request.followup.send.call_args.kwargs["files"])
+
+
+async def test_description_options_registered_with_limits(cog):
+    command = cog.item.get_command("add")
+    description = next(p for p in command.parameters if p.name == "description")
+    assert description.max_value == 4000
+    assert (
+        next(p for p in command.parameters if p.name == "description_image").display_name
+        == "description-image"
+    )

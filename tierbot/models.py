@@ -2,6 +2,8 @@ from dataclasses import dataclass
 
 MAX_TIERS = 15
 MAX_ITEMS = 300
+MAX_DESCRIPTION_LENGTH = 4000
+MAX_DESCRIPTION_IMAGES = 4
 DEFAULT_TIERS = ("S", "A", "B", "C", "D", "F")
 COLORS = ("#ff7f7f", "#ffbf7f", "#ffdf7f", "#ffff7f", "#bfff7f", "#7fff7f")
 
@@ -17,6 +19,8 @@ class Item:
     tier_id: int
     position: int
     image: str | None
+    description: str = ""
+    description_images: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

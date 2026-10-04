@@ -28,7 +28,7 @@ class Page:
     data: bytes
 
 
-def normalize_image(data: bytes) -> bytes:
+def normalize_image(data: bytes, *, max_side: int = 256) -> bytes:
     if len(data) > MAX_UPLOAD_BYTES:
         raise UserError("Images must be no larger than 10 MiB.")
     try:
@@ -39,7 +39,7 @@ def normalize_image(data: bytes) -> bytes:
                     raise UserError("Images must be no larger than 25 megapixels.")
                 source.seek(0)
                 image = ImageOps.exif_transpose(source).convert("RGBA")
-                image.thumbnail((256, 256), Image.Resampling.LANCZOS)
+                image.thumbnail((max_side, max_side), Image.Resampling.LANCZOS)
                 output = io.BytesIO()
                 image.save(output, "PNG")
                 return output.getvalue()

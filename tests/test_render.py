@@ -105,3 +105,24 @@ def test_output_size_failure_is_explicit(store):
     key = store.create("Board")
     with pytest.raises(UserError, match="attachment limit"):
         render_board(store.get(key), store.images, max_file_bytes=10)
+
+
+def test_descriptions_never_appear_on_board(store, image_bytes):
+    key = store.create("Board")
+    store.add_item(key, "One", "S", image=normalize_image(image_bytes))
+    before = store.get(key)
+    pages = render_board(before, store.images)
+    store.edit_item(key, "One", description="PRIVATE DESCRIPTION TEXT")
+    store.add_description_image(key, "One", normalize_image(image_bytes))
+    # Ignore the revision footer; all board pixels must otherwise be identical.
+    after = replace(store.get(key), revision=before.revision)
+    assert render_board(after, store.images) == pages
+
+
+def test_description_images_keep_more_detail_than_board_thumbnails():
+    output = io.BytesIO()
+    Image.new("RGB", (1600, 1200), "blue").save(output, "PNG")
+    with Image.open(io.BytesIO(normalize_image(output.getvalue(), max_side=1024))) as detail:
+        assert detail.size == (1024, 768)
+    with Image.open(io.BytesIO(normalize_image(output.getvalue()))) as thumbnail:
+        assert thumbnail.size == (256, 192)

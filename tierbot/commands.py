@@ -5,7 +5,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from tierbot.models import UserError
+from tierbot.models import MAX_DESCRIPTION_IMAGES, MAX_DESCRIPTION_LENGTH, UserError
 from tierbot.render import MAX_UPLOAD_BYTES, normalize_image
 from tierbot.store import Store, name_key
 from tierbot.sync import Synchronizer, attachments
@@ -137,14 +137,16 @@ class TierCommands(commands.Cog):
             if name_key(current) in name_key(i.name) or current == f"#{i.id}"
         ][:25]
 
-    async def image_data(self, image: discord.Attachment | None):
+    async def image_data(self, image: discord.Attachment | None, *, description: bool = False):
         if image is None:
             return None
         if image.size > MAX_UPLOAD_BYTES:
             raise UserError("Images must be no larger than 10 MiB.")
         async with self.image_slots:
             raw = await image.read()
-            return await asyncio.to_thread(normalize_image, raw)
+            return await asyncio.to_thread(
+                normalize_image, raw, max_side=1024 if description else 256
+            )
 
     async def mutate(self, interaction, list_value, operation):
         if not interaction.response.is_done():
@@ -300,7 +302,15 @@ class TierCommands(commands.Cog):
             interaction, list, lambda key: self.store.delete_tier(key, tier, destination)
         )
 
-    @item.command(name="add", description="Add a named item with an optional uploaded image")
+    @item.command(
+        name="add", description="Add an item with an optional board image and description"
+    )
+    @app_commands.rename(description_image="description-image")
+    @app_commands.describe(
+        image="Thumbnail shown on the tier-list board",
+        description="Details shown only by /item show (Discord formatting supported)",
+        description_image="First description image, shown only by /item show",
+    )
     async def item_add(
         self,
         interaction: discord.Interaction,
@@ -309,15 +319,28 @@ class TierCommands(commands.Cog):
         tier: str,
         image: discord.Attachment | None = None,
         position: app_commands.Range[int, 1, 300] | None = None,
+        description: app_commands.Range[str, 1, MAX_DESCRIPTION_LENGTH] | None = None,
+        description_image: discord.Attachment | None = None,
     ):
         await interaction.response.defer(ephemeral=True, thinking=True)
         data = await self.image_data(image)
+        detail_image = await self.image_data(description_image, description=True)
         await self.mutate(
-            interaction, list, lambda key: self.store.add_item(key, name, tier, position, data)
+            interaction,
+            list,
+            lambda key: self.store.add_item(
+                key,
+                name,
+                tier,
+                position,
+                data,
+                description=description or "",
+                description_image=detail_image,
+            ),
         )
 
     @item.command(
-        name="show", description="Show an item's full name, tier, position, and image privately"
+        name="show", description="Show an item's description, images, and ranking privately"
     )
     async def item_show(self, interaction: discord.Interaction, list: str, item: str):
         await interaction.response.defer(ephemeral=True, thinking=True)
@@ -327,26 +350,51 @@ class TierCommands(commands.Cog):
             tier = self.store.tier(list_id, f"#{entry.tier_id}")
             embed = discord.Embed(
                 title=entry.name,
-                description=f"Tier: {discord.utils.escape_markdown(tier.name)}\n"
-                f"Position: {entry.position + 1}\nItem ID: #{entry.id}",
+                description=entry.description or "No description yet.",
             )
-            file = None
-            if entry.image and (self.store.images / entry.image).is_file():
-                file = discord.File(self.store.images / entry.image, filename="item.png")
-                embed.set_image(url="attachment://item.png")
+            embed.add_field(name="Tier", value=discord.utils.escape_markdown(tier.name))
+            embed.add_field(name="Position", value=str(entry.position + 1))
+            embed.set_footer(text=f"Item ID: #{entry.id}")
+            files, embeds = [], [embed]
             try:
+                if entry.image and (self.store.images / entry.image).is_file():
+                    files.append(discord.File(self.store.images / entry.image, filename="item.png"))
+                    if entry.description_images:
+                        embed.set_thumbnail(url="attachment://item.png")
+                    else:
+                        embed.set_image(url="attachment://item.png")
+                for number, filename in enumerate(entry.description_images, 1):
+                    detail_embed = discord.Embed(title=f"Description image {number}")
+                    path = self.store.images / filename
+                    if path.is_file():
+                        if path.stat().st_size > interaction.filesize_limit:
+                            raise UserError(
+                                "A description image exceeds this interaction's upload limit."
+                            )
+                        attachment_name = f"description-{number}.png"
+                        files.append(discord.File(path, filename=attachment_name))
+                        detail_embed.set_image(url=f"attachment://{attachment_name}")
+                    else:
+                        detail_embed.description = (
+                            "Image file missing. Remove this image and upload it again."
+                        )
+                    embeds.append(detail_embed)
                 await interaction.followup.send(
-                    embed=embed,
-                    files=[file] if file else [],
+                    embeds=embeds,
+                    files=files,
                     ephemeral=True,
                     allowed_mentions=discord.AllowedMentions.none(),
                 )
             finally:
-                if file:
+                for file in files:
                     file.close()
 
-    @item.command(name="edit", description="Rename an item, replace its image, or remove its image")
-    @app_commands.rename(remove_image="remove-image")
+    @item.command(name="edit", description="Edit an item's name, board image, or description")
+    @app_commands.rename(remove_image="remove-image", clear_description="clear-description")
+    @app_commands.describe(
+        description="Replace the description text; existing description images are kept",
+        clear_description="Remove all description text and images; keep the board thumbnail",
+    )
     async def item_edit(
         self,
         interaction: discord.Interaction,
@@ -355,17 +403,61 @@ class TierCommands(commands.Cog):
         name: str | None = None,
         image: discord.Attachment | None = None,
         remove_image: bool = False,
+        description: app_commands.Range[str, 1, MAX_DESCRIPTION_LENGTH] | None = None,
+        clear_description: bool = False,
     ):
         await interaction.response.defer(ephemeral=True, thinking=True)
         if image is not None and remove_image:
             raise UserError("Choose either a replacement image or remove-image, not both.")
+        if description is not None and clear_description:
+            raise UserError("Choose either a new description or clear-description, not both.")
         data = await self.image_data(image)
         await self.mutate(
             interaction,
             list,
             lambda key: self.store.edit_item(
-                key, item, name=name, image=data, remove_image=remove_image
+                key,
+                item,
+                name=name,
+                image=data,
+                remove_image=remove_image,
+                description=description,
+                clear_description=clear_description,
             ),
+        )
+
+    @item.command(
+        name="description-image-add", description="Append an image to an item's description"
+    )
+    async def description_image_add(
+        self,
+        interaction: discord.Interaction,
+        list: str,
+        item: str,
+        image: discord.Attachment,
+    ):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        data = await self.image_data(image, description=True)
+        await self.mutate(
+            interaction, list, lambda key: self.store.add_description_image(key, item, data)
+        )
+
+    @item.command(
+        name="description-image-remove",
+        description="Remove a numbered image from an item's description",
+    )
+    @app_commands.describe(
+        position="Image number shown by /item show; remaining images are renumbered"
+    )
+    async def description_image_remove(
+        self,
+        interaction: discord.Interaction,
+        list: str,
+        item: str,
+        position: app_commands.Range[int, 1, MAX_DESCRIPTION_IMAGES],
+    ):
+        await self.mutate(
+            interaction, list, lambda key: self.store.remove_description_image(key, item, position)
         )
 
     @item.command(
