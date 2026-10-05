@@ -117,23 +117,29 @@ def render_board(
         page_number = len(pages) + 1
         for row_number, (tier, items, continued) in enumerate(selected):
             top = HEADER_HEIGHT + row_number * ROW_HEIGHT
-            draw.rectangle((0, top, TIER_WIDTH - 1, top + ROW_HEIGHT - 2), fill=tier.color)
-            r, g, b = (int(tier.color[i : i + 2], 16) for i in (1, 3, 5))
-            foreground = "#171923" if r * 0.299 + g * 0.587 + b * 0.114 > 145 else "#ffffff"
-            text_block(
-                draw,
-                tier.name,
-                (10, top + 6, TIER_WIDTH - 20, ROW_HEIGHT - 30),
-                tier_font,
-                foreground,
-                5,
-                26,
-                centered=True,
-            )
-            if continued:
-                draw.text(
-                    (12, top + ROW_HEIGHT - 24), "continued", font=small_font, fill=foreground
+            if row_number == 0 or selected[row_number - 1][0].id != tier.id:
+                # One label spans every wrapped item row of this tier on the page.
+                end = row_number + 1
+                while end < len(selected) and selected[end][0].id == tier.id:
+                    end += 1
+                height = (end - row_number) * ROW_HEIGHT
+                draw.rectangle((0, top, TIER_WIDTH - 1, top + height - 2), fill=tier.color)
+                r, g, b = (int(tier.color[i : i + 2], 16) for i in (1, 3, 5))
+                foreground = "#171923" if r * 0.299 + g * 0.587 + b * 0.114 > 145 else "#ffffff"
+                text_block(
+                    draw,
+                    tier.name,
+                    (10, top + 6, TIER_WIDTH - 20, height - 30),
+                    tier_font,
+                    foreground,
+                    5,
+                    26,
+                    centered=True,
                 )
+                if continued:
+                    draw.text(
+                        (12, top + height - 24), "continued", font=small_font, fill=foreground
+                    )
             if not items:
                 draw.text(
                     (TIER_WIDTH + 20, top + 76), "No items yet", font=label_font, fill="#a5adbd"

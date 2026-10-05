@@ -144,7 +144,9 @@ share a channel, but each list has at most one hooked channel. Commands may be
 used from any channel in the server, including a different channel from the board.
 
 Large boards use up to seven image attachments inside the same message, with
-eight tiles per row and eight rows per page. Tier labels repeat across page breaks.
+eight tiles per row and eight rows per page. Wrapped items share one continuous
+tier label spanning their rows; the tier title appears once per page. A label
+repeats only when the tier continues onto another image page.
 Empty tiers remain visible. Long tile labels may be shortened visually; use
 `/item show` to read the complete name. Titles allow 100 characters, tier names 40,
 and item names 80. The bundled Noto Sans font covers Latin, Greek, and Cyrillic;
